@@ -1,31 +1,9 @@
-/**
- * WebSocket subscription service for real-time leader fill events.
- *
- * Subscribes to the leader's fill stream on Hyperliquid and:
- * - Updates leader state incrementally with each fill
- * - Triggers follower sync callback when fills occur
- *
- * This provides low-latency replication compared to polling.
- */
-
-import type * as hl from "@nktkas/hyperliquid";
+import type { SubscriptionClient } from "@nktkas/hyperliquid";
 import type { CopyTradingConfig } from "../config/index.js";
-import { logger, type Logger } from "../utils/logger.js";
-import { LeaderState } from "../domain/leaderState.js";
+import type { LeaderState } from "../domain/leaderState.js";
+import type { Logger } from "../utils/logger.js";
 
-/**
- * Handle for managing an active subscription.
- */
-type SubscriptionHandle = {
-  unsubscribe: () => Promise<void>;
-};
-
-/**
- * Manages WebSocket subscriptions to leader account events.
- */
 export class SubscriptionService {
-  private fillsSub: SubscriptionHandle | null = null;
-
   /**
    * @param subscriptionClient - Hyperliquid WebSocket subscription client
    * @param config - Copy trading configuration
@@ -34,11 +12,11 @@ export class SubscriptionService {
    * @param log - Logger instance
    */
   constructor(
-    private readonly subscriptionClient: hl.SubscriptionClient,
+    private readonly client: SubscriptionClient,
     private readonly config: CopyTradingConfig,
     private readonly leaderState: LeaderState,
-    private readonly onLeaderFill?: () => void | Promise<void>,
-    private readonly log: Logger = logger,
+    private readonly onUpdate: () => Promise<void>,
+    private readonly log: Logger,
   ) {}
 
   /**
@@ -46,46 +24,51 @@ export class SubscriptionService {
    * No-op if already subscribed.
    */
   async start() {
-    if (this.fillsSub) {
-      return;
-    }
+    this.log.info("Starting leader subscriptions", {
+      leader: this.config.leaderAddress,
+    });
 
-    this.log.info("Starting leader subscriptions", { leader: this.config.leaderAddress });
+    // FIX: Pass object { user: address } instead of just the address string
+    await this.client.userFills({ user: this.config.leaderAddress }, (event) => {
+      
+      // --- LOGGING FOR DEBUGGING ---
+      if (event.fills && event.fills.length > 0) {
+        const firstFill = event.fills[0]!;
+        this.log.info("🚨 LEADER TRADED! 🚨", {
+          count: event.fills.length,
+          coin: firstFill.coin,
+          side: firstFill.side,
+          size: firstFill.sz,
+          price: firstFill.px
+        });
+      }
+      // -----------------------------
 
-    // Subscribe to leader's fill events
-    const subscription = await this.subscriptionClient.userFills(
-      {
-        user: this.config.leaderAddress as `0x${string}`,
-        aggregateByTime: this.config.websocketAggregateFills,
-      },
-      (event) => {
-        this.log.debug("Received leader fills event", { count: event.fills.length });
+      if (event.isSnapshot) {
+        this.log.debug("Received initial fill snapshot");
+        return;
+      }
 
-        // Update leader state incrementally
-        this.leaderState.handleFillEvent(event);
+      if (event.fills.length > 0) {
+        try {
+          // 2. Update Internal State
+          this.leaderState.handleFillEvent(event);
+          
+          // --- NEW LOG HERE ---
+          this.log.info("⚡ Triggering Trade Executor (onUpdate)...");
+          // --------------------
 
-        // Trigger sync callback (e.g., to execute follower orders)
-        void this.onLeaderFill?.();
-      },
-    );
-
-    this.fillsSub = {
-      unsubscribe: () => subscription.unsubscribe(),
-    };
+          // 3. Trigger the trade sync
+          void this.onUpdate();
+        } catch (err) {
+          this.log.error("Failed to handle leader fill event", { error: err });
+        }
+      }
+    });
   }
 
-  /**
-   * Stops WebSocket subscription to leader fills.
-   * No-op if not subscribed.
-   */
   async stop() {
-    if (!this.fillsSub) {
-      return;
-    }
-    this.log.info("Stopping leader subscriptions");
-    await this.fillsSub.unsubscribe().catch((error) => {
-      this.log.error("Failed to unsubscribe from fills", { error });
-    });
-    this.fillsSub = null;
+    this.log.info("Stopping subscriptions");
+    // No explicit unsubscribe needed as SDK handles it on transport close
   }
 }

@@ -38,7 +38,28 @@ async function main() {
     // Initialize Hyperliquid API clients (HTTP + WebSocket)
     const clients = createHyperliquidClients(config);
 
-    // State stores for leader and follower positions
+    // --- CRITICAL FIX: FORCE MAIN WALLET ADDRESS ---
+    // We check process.env directly to bypass any config loading issues
+    const envPublicAddress = process.env.FOLLOWER_PUBLIC_ADDRESS;
+    const actualFollowerAddress = (envPublicAddress && envPublicAddress.startsWith("0x")) 
+      ? envPublicAddress as `0x${string}`
+      : clients.followerTradingAddress;
+
+    // Log the decision
+    console.log("\n========================================");
+    console.log("🕵️ ADDRESS CONFIGURATION");
+    console.log("========================================");
+    console.log(`🔑 Signer (API Key):   ${clients.followerTradingAddress}`);
+    console.log(`💰 Wallet (Funds):     ${actualFollowerAddress}`);
+    if (clients.followerTradingAddress === actualFollowerAddress) {
+        console.log("⚠️  Note: Signer and Wallet are the same. Ensure this key has funds.");
+    } else {
+        console.log("✅  Correct: Signing with Agent, checking Main Wallet for funds.");
+    }
+    console.log("========================================\n");
+    // -----------------------------------------------
+
+    // 3. Setup State
     const leaderState = new LeaderState();
     const followerState = new FollowerState();
 
@@ -49,7 +70,7 @@ async function main() {
     const tradeExecutor = new TradeExecutor({
       exchangeClient: clients.exchangeClient,
       infoClient: clients.infoClient,
-      followerAddress: clients.followerTradingAddress,
+      followerAddress: actualFollowerAddress, // <--- USE FORCED ADDRESS
       leaderState,
       followerState,
       metadataService,
@@ -63,7 +84,7 @@ async function main() {
       config,
       leaderState,
       followerState,
-      clients.followerTradingAddress,
+      actualFollowerAddress, // <--- USE FORCED ADDRESS
       logger,
     );
 
@@ -76,13 +97,28 @@ async function main() {
       logger,
     );
 
-    // Start WebSocket subscriptions to leader fills
+    // --- STARTUP SEQUENCE ---
+    logger.info(`Starting Bot in [${config.environment.toUpperCase()}] mode`);
+    logger.info(`Leader:   ${config.leaderAddress}`);
+
+    // A. Connect to WebSocket
     await subscriptions.start();
 
-    // Perform initial reconciliation to sync state
+    // B. Fetch Initial State
+    logger.info("Fetching initial account state...");
     await reconciler.reconcileOnce();
 
-    // Start periodic reconciliation loop
+    // C. Print Startup Balance
+    const metrics = followerState.getMetrics();
+    console.log("\n========================================");
+    console.log("🚀 BOT LIVE & READY");
+    console.log("========================================");
+    console.log(`💵 Usable USDC:       $${metrics.withdrawableUsd.toFixed(2)}`);
+    console.log(`📊 Account Equity:    $${metrics.accountValueUsd.toFixed(2)}`);
+    console.log(`🎯 Copy Mode:         ${process.env.COPY_MODE === 'exact' ? 'EXACT MIRROR' : 'RATIO SCALING'}`);
+    console.log("========================================\n");
+
+    // D. Start Loops
     reconciler.start();
 
     /**

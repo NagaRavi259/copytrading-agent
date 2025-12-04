@@ -18,10 +18,14 @@ import { LeaderState } from "../domain/leaderState.js";
 import { FollowerState, type PositionDelta } from "../domain/followerState.js";
 import { MarketMetadataService } from "./marketMetadata.js";
 
-/** Minimum absolute position delta to trigger an order (prevents dust trades) */
-const MIN_ABS_DELTA = 1e-6;
+/** Minimum absolute position delta to trigger an order (prevents dust trades).
+ *  Now supports override via ENV but defaults to same value as before. */
+const MIN_ABS_DELTA = Number(process.env.MIN_ABS_DELTA ?? 1e-6);
 /** Exchange minimum order notional (USD). Override with env MIN_ORDER_NOTIONAL_USD if needed. */
 const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD ?? 10);
+
+/** Exact-mirror mode: directly mirror leader size instead of scaling by copyRatio. */
+const IS_EXACT_MODE = process.env.COPY_MODE === "exact";
 
 /**
  * Determines the number of decimal places in a number's string representation.
@@ -121,21 +125,37 @@ export class TradeExecutor {
 
       // Compute leader's current leverage for each position
       const targets = this.deps.leaderState.computeTargets(this.deps.metadataService);
+
+      let deltas: PositionDelta[];
       
-      if (targets.length > 0) {
-        this.log.debug("Leader positions and leverage", {
-          positions: targets.map((t) => ({
-            coin: t.coin,
-            leverage: t.leaderLeverage.toFixed(2) + "x",
-            markPrice: t.markPrice,
-          })),
+      if (IS_EXACT_MODE) {
+        // Exact mirror mode: do not scale by copyRatio
+        const allCoins = new Set<string>();
+        targets.forEach((t) => allCoins.add(t.coin));
+        Array.from(this.deps.followerState.getPositions().keys()).forEach((c) =>
+          allCoins.add(c)
+        );
+
+        deltas = Array.from(allCoins).map((coin) => {
+          const target = targets.find((t) => t.coin === coin);
+          const current = this.deps.followerState.getPosition(coin);
+
+          const targetSize = target ? target.leaderSize : 0;
+          const currentSize = current?.size || 0;
+
+          return {
+            coin,
+            targetSize,
+            current,
+            deltaSize: targetSize - currentSize,
+            maxNotionalUsd: this.deps.risk.maxNotionalUsd, // required field (bug fix)
+          };
         });
+      } else {
+        // Original ratio-scaled logic (unchanged)
+        deltas = this.deps.followerState.computeDeltas(targets, this.deps.risk);
       }
 
-      // Compute deltas between current and target positions (scales leverage by copyRatio)
-      const deltas = this.deps.followerState.computeDeltas(targets, this.deps.risk);
-
-      // Filter out dust deltas that are too small to trade
       const actionable = deltas.filter((delta) => Math.abs(delta.deltaSize) > MIN_ABS_DELTA);
 
       if (actionable.length === 0) {

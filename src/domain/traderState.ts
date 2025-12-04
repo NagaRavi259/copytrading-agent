@@ -73,7 +73,14 @@ export class TraderStateStore {
    * @param event - User fills event from Hyperliquid WebSocket
    */
   handleFillEvent(event: UserFillsEvent) {
-    for (const fill of event.fills) {
+    // FIX: Force 'fills' to be a real array. 
+    // This handles cases where the SDK returns an array-like object or undefined.
+    // We use 'any' cast for event.fills to allow Array.from to handle potential non-iterable array-likes.
+    const fills = Array.isArray(event.fills) 
+      ? event.fills 
+      : Array.from((event.fills as any) || []);
+
+    for (const fill of fills) {
       this.applyFill(fill as Fill);
     }
   }
